@@ -1,5 +1,6 @@
 
 #include <errno.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -21,6 +22,20 @@
         goto defer;     \
     } while (0)
 
+void log_event(FILE* events_log, FILE* out, const char* fmt, ...) {
+    va_list args1, args2;
+
+    va_start(args1, fmt);
+    va_copy(args2, args1);
+
+    vfprintf(events_log, fmt, args1);
+    vfprintf(out, fmt, args2);
+    fflush(events_log);
+
+    va_end(args1);
+    va_end(args2);
+}
+
 typedef struct {
     Worker* worker;
     AllHistory history;
@@ -28,7 +43,7 @@ typedef struct {
 
 typedef struct {
     Worker* worker;
-    BalanceState* balance;
+    balance_t balance;
     BalanceHistory history;
 } BankAccountWorker;
 
@@ -38,63 +53,114 @@ int execute_bank_account_worker(BankAccountWorker s) {
     size_t started = 0;
     size_t done = 0;
 
+    // notify we everyone that we STARTED
     timestamp = get_physical_time();
     msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = STARTED, .s_local_time = timestamp } };
-    sprintf(msg.s_payload, log_started_fmt, timestamp, s.worker->id, getpid(), getppid(), s.balance->s_balance);
+    sprintf(msg.s_payload, log_started_fmt, timestamp, s.worker->id, getpid(), getppid(), s.balance);
     msg.s_header.s_payload_len = strlen(msg.s_payload);
     if (send_multicast(s.worker, &msg) != 0) {
-        fprintf(s.worker->events_log, "Process %1d failed to multicast STARTED message: %s\n", s.worker->id, strerror(errno));
-        fprintf(stderr, "Process %1d failed to multicast STARTED message: %s\n", s.worker->id, strerror(errno));
-        fflush(s.worker->events_log);
+        log_event(s.worker->events_log, stderr, "Process %1d failed to multicast STARTED message: %s\n", s.worker->id, strerror(errno));
         return 1;
     }
-    fwrite(msg.s_payload, sizeof(char), msg.s_header.s_payload_len, s.worker->events_log);
-    fwrite(msg.s_payload, sizeof(char), msg.s_header.s_payload_len, stdout);
-    fflush(s.worker->events_log);
+    log_event(s.worker->events_log, stdout, log_started_fmt, timestamp, s.worker->id, getpid(), getppid(), s.balance);
 
-    while (started != s.worker->nbr_count - 1) {
+    // until we receive all STARTED messages nobody have started yet so only STARTED messages are expected
+    while (started != s.worker->nbr_count) {
         if (receive_any(s.worker, &msg) != 0) {
-            fprintf(s.worker->events_log, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fprintf(stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fflush(s.worker->events_log);
+            log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
             return 1;
         }
-        if (msg.s_header.s_type == STARTED) started++;
-        if (msg.s_header.s_type == DONE) done++;
+        if (msg.s_header.s_type == STARTED) {
+            started++;
+        } else {
+            log_event(s.worker->events_log, stderr, "Process %1d received [%d] message when STARTED was expected\n", s.worker->id, msg.s_header.s_type);
+            return 1;
+        }
     }
     timestamp = get_physical_time();
-    fprintf(s.worker->events_log, log_received_all_started_fmt, timestamp, s.worker->id);
-    fprintf(stdout, log_received_all_started_fmt, timestamp, s.worker->id);
-    fflush(s.worker->events_log);
+    log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
 
-    timestamp = get_physical_time();
-    msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = DONE, .s_local_time = timestamp } };
-    sprintf(msg.s_payload, log_done_fmt, timestamp, s.worker->id, s.balance->s_balance);
-    msg.s_header.s_payload_len = strlen(msg.s_payload);
-    if (send_multicast(s.worker, &msg) != 0) {
-        fprintf(s.worker->events_log, "Process %1d failed to multicast DONE message: %s\n", s.worker->id, strerror(errno));
-        fprintf(stderr, "Process %1d failed to multicast DONE message: %s\n", s.worker->id, strerror(errno));
-        fflush(s.worker->events_log);
+    // process TRANSFER/STOP/DONE messages
+    while (done == s.worker->nbr_count - 1) {
+        if (receive_any(s.worker, &msg) != 0) {
+            log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
+            return 1;
+        }
+        timestamp = get_physical_time();
+
+        switch (msg.s_header.s_type) {
+        case (TRANSFER): {
+            TransferOrder* order = (TransferOrder*)msg.s_payload;
+
+            // fill gaps in the balance history
+            for (timestamp_t t = s.history.s_history_len; t < timestamp; t++) {
+                s.history.s_history[t].s_time = t;
+                s.history.s_history[t].s_balance = s.history.s_history[s.history.s_history_len - 1].s_balance;
+                s.history.s_history[t].s_balance_pending_in = 0;
+            }
+
+            // update balance
+            if (order->s_src == s.worker->id) {
+                s.balance -= order->s_amount;
+            } else {
+                s.balance += order->s_amount;
+            }
+
+            // add new transaction to the history
+            s.history.s_history[timestamp] = (BalanceState) {
+                .s_time = timestamp,
+                .s_balance = s.balance,
+                .s_balance_pending_in = 0,
+            };
+
+            if (order->s_src == s.worker->id) {
+                // transmit transaction to the destination account
+                msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = TRANSFER, .s_local_time = timestamp, .s_payload_len = msg.s_header.s_payload_len } };
+                memcpy(msg.s_payload, order, msg.s_header.s_payload_len);
+                if (send(s.worker, order->s_dst, &msg) != 0) {
+                    log_event(s.worker->events_log, stderr, "Process %1d failed to send TRANSFER message to %1d: %s\n", s.worker->id, order->s_dst, strerror(errno));
+                    return 1;
+                }
+                log_event(s.worker->events_log, stdout, log_transfer_out_fmt, timestamp, s.worker->id, order->s_amount, order->s_dst);
+            } else {
+                // transmit ack to the parent
+                msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = ACK, .s_local_time = timestamp } };
+                if (send(s.worker, PARENT_ID, &msg) != 0) {
+                    log_event(s.worker->events_log, stderr, "Process %1d failed to send TRANSFER message to %1d: %s\n", s.worker->id, PARENT_ID, strerror(errno));
+                    return 1;
+                }
+                log_event(s.worker->events_log, stdout, log_transfer_in_fmt, timestamp, s.worker->id, order->s_amount, order->s_src);
+            }
+        } break;
+        case (STOP): {
+            msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = DONE, .s_local_time = timestamp } };
+            sprintf(msg.s_payload, log_done_fmt, timestamp, s.worker->id, s.balance);
+            msg.s_header.s_payload_len = strlen(msg.s_payload);
+            if (send_multicast(s.worker, &msg) != 0) {
+                log_event(s.worker->events_log, stderr, "Process %1d failed to multicast DONE message: %s\n", s.worker->id, strerror(errno));
+                return 1;
+            }
+            log_event(s.worker->events_log, stdout, log_done_fmt, timestamp, s.worker->id, s.balance);
+        } break;
+        case (DONE): {
+            done++;
+        } break;
+        default: {
+            log_event(s.worker->events_log, stderr, "Process %1d received unexpected message [%d]\n", s.worker->id, msg.s_header.s_type);
+            return 1;
+        } break;
+        }
+    }
+    log_event(s.worker->events_log, stdout, log_received_all_done_fmt, timestamp, s.worker->id);
+
+    // send balance history to the parent
+    size_t payload_len = sizeof(s.history.s_id) + sizeof(s.history.s_history_len) + s.history.s_history_len;
+    msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = BALANCE_HISTORY, .s_local_time = timestamp, .s_payload_len = payload_len } };
+    memcpy(msg.s_payload, &s.history, payload_len);
+    if (send(s.worker, PARENT_ID, &msg) != 0) {
+        log_event(s.worker->events_log, stderr, "Process %1d failed to send BALANCE_HISTORY message to %1d: %s\n", s.worker->id, PARENT_ID, strerror(errno));
         return 1;
     }
-    fwrite(msg.s_payload, sizeof(char), msg.s_header.s_payload_len, s.worker->events_log);
-    fwrite(msg.s_payload, sizeof(char), msg.s_header.s_payload_len, stdout);
-    fflush(s.worker->events_log);
-
-    while (done != s.worker->nbr_count - 1) {
-        if (receive_any(s.worker, &msg) != 0) {
-            fprintf(s.worker->events_log, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fprintf(stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fflush(s.worker->events_log);
-            return 1;
-        }
-        if (msg.s_header.s_type == DONE) done++;
-    }
-    timestamp = get_physical_time();
-    fprintf(s.worker->events_log, log_received_all_done_fmt, timestamp, s.worker->id);
-    fprintf(stdout, log_received_all_done_fmt, timestamp, s.worker->id);
-    fflush(s.worker->events_log);
-
     return 0;
 }
 
@@ -104,46 +170,59 @@ int execute_bank_client_worker(BankClientWorker s) {
     size_t started = 0;
     size_t done = 0;
 
+    // wait for all STARTED messages
     while (started != s.worker->nbr_count) {
         if (receive_any(s.worker, &msg) != 0) {
-            fprintf(s.worker->events_log, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fprintf(stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fflush(s.worker->events_log);
+            log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
             return 1;
         }
-        if (msg.s_header.s_type == STARTED) started++;
-        if (msg.s_header.s_type == DONE) done++;
+        if (msg.s_header.s_type == STARTED) {
+            started++;
+        } else {
+            log_event(s.worker->events_log, stderr, "Process %1d received [%d] message when STARTED was expected\n", s.worker->id, msg.s_header.s_type);
+            return 1;
+        }
     }
     timestamp = get_physical_time();
-    fprintf(s.worker->events_log, log_received_all_started_fmt, timestamp, s.worker->id);
-    fprintf(stdout, log_received_all_started_fmt, timestamp, s.worker->id);
-    fflush(s.worker->events_log);
+    log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
 
+    // random balance transfers
     bank_robbery(&s, s.worker->nbr_count + 1);
 
+    // stop account workers
     timestamp = get_physical_time();
     msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = STOP, .s_local_time = timestamp } };
     if (send_multicast(s.worker, &msg) != 0) {
-        fprintf(s.worker->events_log, "Process %1d failed to multicast STOP message: %s\n", s.worker->id, strerror(errno));
-        fprintf(stderr, "Process %1d failed to multicast STOP message: %s\n", s.worker->id, strerror(errno));
-        fflush(s.worker->events_log);
+        log_event(s.worker->events_log, stderr, "Process %1d failed to multicast STOP message: %s\n", s.worker->id, strerror(errno));
         return 1;
     }
 
+    // collect DONE and BALANCE_HISTORY messages
     while (done != s.worker->nbr_count) {
         if (receive_any(s.worker, &msg) != 0) {
-            fprintf(s.worker->events_log, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fprintf(stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            fflush(s.worker->events_log);
+            log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
             return 1;
         }
-        if (msg.s_header.s_type == DONE) done++;
+        timestamp = get_physical_time();
+
+        switch (msg.s_header.s_type) {
+        case (DONE): {
+            done++;
+        } break;
+        case (BALANCE_HISTORY): {
+            BalanceHistory* history = (BalanceHistory*)msg.s_payload;
+            s.history.s_history[history->s_id] = *history;
+        } break;
+        default: {
+            log_event(s.worker->events_log, stderr, "Process %1d received unexpected message [%d]\n", s.worker->id, msg.s_header.s_type);
+            return 1;
+        } break;
+        }
     }
     timestamp = get_physical_time();
-    fprintf(s.worker->events_log, log_received_all_done_fmt, timestamp, s.worker->id);
-    fprintf(stdout, log_received_all_done_fmt, timestamp, s.worker->id);
-    fflush(s.worker->events_log);
+    log_event(s.worker->events_log, stdout, log_received_all_done_fmt, timestamp, s.worker->id);
 
+    print_history(&s.history);
     return 0;
 }
 
@@ -227,12 +306,13 @@ int main(int argc, char** argv) {
             w = &workers[worker_id];
             BankAccountWorker bank_account_worker = {
                 .worker = w,
+                .balance = args.initial_balances[worker_id],
                 .history = {
                     .s_id = worker_id,
-                    .s_history_len = 0,
-                    .s_history = { [0] = { .s_time = 0, .s_balance = args.initial_balances[worker_id], .s_balance_pending_in = 0 } } }
+                    .s_history_len = 1,
+                    .s_history = { [0] = { .s_time = 0, .s_balance = args.initial_balances[worker_id], .s_balance_pending_in = 0 } },
+                },
             };
-            bank_account_worker.balance = &bank_account_worker.history.s_history[0];
             deinit_unused_channels(w, workers, pipes_log_fd);
 
             int status = execute_bank_account_worker(bank_account_worker);
@@ -242,7 +322,7 @@ int main(int argc, char** argv) {
     }
 
     w = &workers[PARENT_ID];
-    BankClientWorker bank_client_worker = { .worker = w };
+    BankClientWorker bank_client_worker = { .worker = w, .history = { .s_history_len = args.bank_account_workers_count } };
     deinit_unused_channels(bank_client_worker.worker, workers, pipes_log_fd);
 
     int status = execute_bank_client_worker(bank_client_worker);
