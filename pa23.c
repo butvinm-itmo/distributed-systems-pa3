@@ -65,7 +65,7 @@ int execute_bank_account_worker(BankAccountWorker s) {
     log_event(s.worker->events_log, stdout, log_started_fmt, timestamp, s.worker->id, getpid(), getppid(), s.balance);
 
     // process TRANSFER/STOP/DONE messages
-    while (done != s.worker->nbr_count - 1) {
+    while (started != s.worker->nbr_count - 1 || done != s.worker->nbr_count - 1) {
         if (receive_any(s.worker, &msg) != 0) {
             log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
             return 1;
@@ -77,12 +77,12 @@ int execute_bank_account_worker(BankAccountWorker s) {
             // actually, we should proceed to the work only after all STARTED messages received,
             // but since parent may receive them earlier and send TRANSFER/STOP to us, we just pretend to wait for all process to start
             started++;
-            if (started == s.worker->nbr_count) {
+            if (started == s.worker->nbr_count - 1) {
                 log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
             }
         } break;
         case (TRANSFER): {
-            TransferOrder* order = (TransferOrder*)msg.s_payload;
+            TransferOrder order = *(TransferOrder*)msg.s_payload;
 
             // fill gaps in the balance history
             for (timestamp_t t = s.history.s_history_len; t < timestamp; t++) {
@@ -92,10 +92,10 @@ int execute_bank_account_worker(BankAccountWorker s) {
             }
 
             // update balance
-            if (order->s_src == s.worker->id) {
-                s.balance -= order->s_amount;
+            if (order.s_src == s.worker->id) {
+                s.balance -= order.s_amount;
             } else {
-                s.balance += order->s_amount;
+                s.balance += order.s_amount;
             }
 
             // add new transaction to the history
@@ -104,16 +104,17 @@ int execute_bank_account_worker(BankAccountWorker s) {
                 .s_balance = s.balance,
                 .s_balance_pending_in = 0,
             };
-
-            if (order->s_src == s.worker->id) {
+            s.history.s_history_len = timestamp + 1;
+            
+            if (order.s_src == s.worker->id) {
                 // transmit transaction to the destination account
-                msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = TRANSFER, .s_local_time = timestamp, .s_payload_len = msg.s_header.s_payload_len } };
-                memcpy(msg.s_payload, order, msg.s_header.s_payload_len);
-                if (send(s.worker, order->s_dst, &msg) != 0) {
-                    log_event(s.worker->events_log, stderr, "Process %1d failed to send TRANSFER message to %1d: %s\n", s.worker->id, order->s_dst, strerror(errno));
+                msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = TRANSFER, .s_local_time = timestamp, .s_payload_len = sizeof(TransferOrder) } };
+                memcpy(msg.s_payload, &order, sizeof(TransferOrder));
+                if (send(s.worker, order.s_dst, &msg) != 0) {
+                    log_event(s.worker->events_log, stderr, "Process %1d failed to send TRANSFER message to %1d: %s\n", s.worker->id, order.s_dst, strerror(errno));
                     return 1;
                 }
-                log_event(s.worker->events_log, stdout, log_transfer_out_fmt, timestamp, s.worker->id, order->s_amount, order->s_dst);
+                log_event(s.worker->events_log, stdout, log_transfer_out_fmt, timestamp, s.worker->id, order.s_amount, order.s_dst);
             } else {
                 // transmit ack to the parent
                 msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = ACK, .s_local_time = timestamp } };
@@ -121,7 +122,7 @@ int execute_bank_account_worker(BankAccountWorker s) {
                     log_event(s.worker->events_log, stderr, "Process %1d failed to send TRANSFER message to %1d: %s\n", s.worker->id, PARENT_ID, strerror(errno));
                     return 1;
                 }
-                log_event(s.worker->events_log, stdout, log_transfer_in_fmt, timestamp, s.worker->id, order->s_amount, order->s_src);
+                log_event(s.worker->events_log, stdout, log_transfer_in_fmt, timestamp, s.worker->id, order.s_amount, order.s_src);
             }
         } break;
         case (STOP): {
@@ -138,6 +139,9 @@ int execute_bank_account_worker(BankAccountWorker s) {
         } break;
         case (DONE): {
             done++;
+            if (done != s.worker->nbr_count - 1) {
+                log_event(s.worker->events_log, stdout, log_received_all_done_fmt, timestamp, s.worker->id);
+            }
         } break;
         default: {
             log_event(s.worker->events_log, stderr, "Process %1d received unexpected message [%d]\n", s.worker->id, msg.s_header.s_type);
@@ -145,10 +149,18 @@ int execute_bank_account_worker(BankAccountWorker s) {
         } break;
         }
     }
-    log_event(s.worker->events_log, stdout, log_received_all_done_fmt, timestamp, s.worker->id);
+
+    // fill gaps in the balance history
+    timestamp = get_physical_time();
+    for (timestamp_t t = s.history.s_history_len; t <= timestamp; t++) {
+        s.history.s_history[t].s_time = t;
+        s.history.s_history[t].s_balance = s.history.s_history[s.history.s_history_len - 1].s_balance;
+        s.history.s_history[t].s_balance_pending_in = 0;
+    }
+    s.history.s_history_len = timestamp + 1;
 
     // send balance history to the parent
-    size_t payload_len = sizeof(s.history.s_id) + sizeof(s.history.s_history_len) + s.history.s_history_len;
+    size_t payload_len = sizeof(s.history.s_id) + sizeof(s.history.s_history_len) + s.history.s_history_len * sizeof(BalanceState);
     msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = BALANCE_HISTORY, .s_local_time = timestamp, .s_payload_len = payload_len } };
     memcpy(msg.s_payload, &s.history, payload_len);
     if (send(s.worker, PARENT_ID, &msg) != 0) {
@@ -165,7 +177,7 @@ int execute_bank_client_worker(BankClientWorker s) {
     size_t done = 0;
 
     // collect DONE and BALANCE_HISTORY messages
-    while (done != s.worker->nbr_count) {
+    while (started != s.worker->nbr_count || done != s.worker->nbr_count) {
         if (receive_any(s.worker, &msg) != 0) {
             log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
             return 1;
@@ -179,7 +191,7 @@ int execute_bank_client_worker(BankClientWorker s) {
                 log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
 
                 // random balance transfers
-                bank_robbery(&s, s.worker->nbr_count + 1);
+                bank_robbery(&s, s.worker->nbr_count);
 
                 // stop account workers
                 timestamp = get_physical_time();
@@ -191,11 +203,16 @@ int execute_bank_client_worker(BankClientWorker s) {
             }
         } break;
         case (DONE): {
-            done++;
+            // count DONE by balance history
         } break;
         case (BALANCE_HISTORY): {
-            BalanceHistory* history = (BalanceHistory*)msg.s_payload;
-            s.history.s_history[history->s_id] = *history;
+            BalanceHistory history = *(BalanceHistory*)msg.s_payload;
+            // Store at index = process_id - 1 to make it contiguous (processes are 1-indexed)
+            s.history.s_history[history.s_id - 1] = history;
+            done++;
+            if (done == s.worker->nbr_count) {
+                log_event(s.worker->events_log, stdout, log_received_all_done_fmt, timestamp, s.worker->id);
+            }
         } break;
         default: {
             log_event(s.worker->events_log, stderr, "Process %1d received unexpected message [%d]\n", s.worker->id, msg.s_header.s_type);
@@ -203,15 +220,35 @@ int execute_bank_client_worker(BankClientWorker s) {
         } break;
         }
     }
-    timestamp = get_physical_time();
-    log_event(s.worker->events_log, stdout, log_received_all_done_fmt, timestamp, s.worker->id);
 
     print_history(&s.history);
     return 0;
 }
 
 void transfer(void* parent_data, local_id src, local_id dst, balance_t amount) {
-    printf("Will transfer $%d from %1d to %1d\n", amount, src, dst);
+    BankClientWorker* s = (BankClientWorker*)parent_data;
+    timestamp_t timestamp;
+    Message msg;
+
+    TransferOrder order = { .s_src = src, .s_dst = dst, .s_amount = amount };
+
+    timestamp = get_physical_time();
+    msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = TRANSFER, .s_local_time = timestamp, .s_payload_len = sizeof(order) } };
+    memcpy(msg.s_payload, &order, msg.s_header.s_payload_len);
+    if (send(s->worker, src, &msg) != 0) {
+        log_event(s->worker->events_log, stderr, "Process %1d failed to send TRANSFER message to %1d: %s\n", s->worker->id, src, strerror(errno));
+        return;
+    }
+
+    if (receive(s->worker, dst, &msg) != 0) {
+        log_event(s->worker->events_log, stderr, "Process %1d failed to receive message from %1d: %s\n", s->worker->id, dst, strerror(errno));
+        return;
+    }
+
+    if (msg.s_header.s_type != ACK) {
+        log_event(s->worker->events_log, stderr, "Process %1d expected to receive ACK message from %1d, but got [%d]\n", s->worker->id, dst, msg.s_header.s_type);
+        return;
+    }
 }
 
 typedef struct {
