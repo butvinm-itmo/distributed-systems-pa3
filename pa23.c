@@ -64,24 +64,8 @@ int execute_bank_account_worker(BankAccountWorker s) {
     }
     log_event(s.worker->events_log, stdout, log_started_fmt, timestamp, s.worker->id, getpid(), getppid(), s.balance);
 
-    // until we receive all STARTED messages nobody have started yet so only STARTED messages are expected
-    while (started != s.worker->nbr_count) {
-        if (receive_any(s.worker, &msg) != 0) {
-            log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            return 1;
-        }
-        if (msg.s_header.s_type == STARTED) {
-            started++;
-        } else {
-            log_event(s.worker->events_log, stderr, "Process %1d received [%d] message when STARTED was expected\n", s.worker->id, msg.s_header.s_type);
-            return 1;
-        }
-    }
-    timestamp = get_physical_time();
-    log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
-
     // process TRANSFER/STOP/DONE messages
-    while (done == s.worker->nbr_count - 1) {
+    while (done != s.worker->nbr_count - 1) {
         if (receive_any(s.worker, &msg) != 0) {
             log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
             return 1;
@@ -89,6 +73,14 @@ int execute_bank_account_worker(BankAccountWorker s) {
         timestamp = get_physical_time();
 
         switch (msg.s_header.s_type) {
+        case (STARTED): {
+            // actually, we should proceed to the work only after all STARTED messages received,
+            // but since parent may receive them earlier and send TRANSFER/STOP to us, we just pretend to wait for all process to start
+            started++;
+            if (started == s.worker->nbr_count) {
+                log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
+            }
+        } break;
         case (TRANSFER): {
             TransferOrder* order = (TransferOrder*)msg.s_payload;
 
@@ -133,6 +125,8 @@ int execute_bank_account_worker(BankAccountWorker s) {
             }
         } break;
         case (STOP): {
+            // notify that we are done immediately after STOP, but keep reading TRANSFER until receive all DONE messages
+            // thats stupid and not obvious from spec but I don't see other way to synchronize right now
             msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = DONE, .s_local_time = timestamp } };
             sprintf(msg.s_payload, log_done_fmt, timestamp, s.worker->id, s.balance);
             msg.s_header.s_payload_len = strlen(msg.s_payload);
@@ -170,33 +164,6 @@ int execute_bank_client_worker(BankClientWorker s) {
     size_t started = 0;
     size_t done = 0;
 
-    // wait for all STARTED messages
-    while (started != s.worker->nbr_count) {
-        if (receive_any(s.worker, &msg) != 0) {
-            log_event(s.worker->events_log, stderr, "Process %1d failed to receive message: %s\n", s.worker->id, strerror(errno));
-            return 1;
-        }
-        if (msg.s_header.s_type == STARTED) {
-            started++;
-        } else {
-            log_event(s.worker->events_log, stderr, "Process %1d received [%d] message when STARTED was expected\n", s.worker->id, msg.s_header.s_type);
-            return 1;
-        }
-    }
-    timestamp = get_physical_time();
-    log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
-
-    // random balance transfers
-    bank_robbery(&s, s.worker->nbr_count + 1);
-
-    // stop account workers
-    timestamp = get_physical_time();
-    msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = STOP, .s_local_time = timestamp } };
-    if (send_multicast(s.worker, &msg) != 0) {
-        log_event(s.worker->events_log, stderr, "Process %1d failed to multicast STOP message: %s\n", s.worker->id, strerror(errno));
-        return 1;
-    }
-
     // collect DONE and BALANCE_HISTORY messages
     while (done != s.worker->nbr_count) {
         if (receive_any(s.worker, &msg) != 0) {
@@ -206,6 +173,23 @@ int execute_bank_client_worker(BankClientWorker s) {
         timestamp = get_physical_time();
 
         switch (msg.s_header.s_type) {
+        case (STARTED): {
+            started++;
+            if (started == s.worker->nbr_count) {
+                log_event(s.worker->events_log, stdout, log_received_all_started_fmt, timestamp, s.worker->id);
+
+                // random balance transfers
+                bank_robbery(&s, s.worker->nbr_count + 1);
+
+                // stop account workers
+                timestamp = get_physical_time();
+                msg = (Message) { .s_header = { .s_magic = MESSAGE_MAGIC, .s_type = STOP, .s_local_time = timestamp } };
+                if (send_multicast(s.worker, &msg) != 0) {
+                    log_event(s.worker->events_log, stderr, "Process %1d failed to multicast STOP message: %s\n", s.worker->id, strerror(errno));
+                    return 1;
+                }
+            }
+        } break;
         case (DONE): {
             done++;
         } break;
