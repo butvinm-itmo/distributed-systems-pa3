@@ -2,8 +2,8 @@
 
 set -e  # Exit on any error
 
-# Run the program
-./run.sh -p 3
+# Run the program with 3 processes and initial balances $10, $20, $30
+./run.sh -p 3 10 20 30
 
 # Parse the number of processes (excluding process 0 which is parent)
 NUM_PROCESSES=$(grep -oP 'Process \K\d+(?= \(pid)' events.log | sort -u | wc -l)
