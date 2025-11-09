@@ -87,13 +87,13 @@ void bank_robbery(void * parent_data, local_id max_id);
 /** 
  * Returs the value of Lamport's clock.
  */
-timestamp_t get_lamport_time();
+timestamp_t get_lamport_time(void);
 
 /** Returns physical time.
  *
  * Emulates physical clock (for each process).
  */
-timestamp_t get_physical_time();
+timestamp_t get_physical_time(void);
 
 /** Pretty print for BalanceHistories.
  * 
