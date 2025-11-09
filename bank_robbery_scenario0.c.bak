@@ -1,0 +1,23 @@
+/**
+ * @file     bank_robbery_scenario0.c
+ * @brief    Scenario 0: Forward Circle Pattern (Original)
+ *
+ * Pattern: Each process transfers to the next in a circular chain
+ * Transfers: 1→2 $1, 2→3 $2, 3→1 $1
+ *
+ * With -p 3 10 20 30:
+ * Initial: P1=$10, P2=$20, P3=$30 (Total=$60)
+ * Final:   P1=$10, P2=$19, P3=$31 (Total=$60)
+ */
+
+#include "banking.h"
+
+void bank_robbery(void * parent_data, local_id max_id)
+{
+    for (int i = 1; i < max_id; ++i) {
+        transfer(parent_data, i, i + 1, i);
+    }
+    if (max_id > 1) {
+        transfer(parent_data, max_id, 1, 1);
+    }
+}

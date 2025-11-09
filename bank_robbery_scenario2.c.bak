@@ -1,0 +1,24 @@
+/**
+ * @file     bank_robbery_scenario2.c
+ * @brief    Scenario 2: Robin Hood - Redistribute Wealth
+ *
+ * Pattern: Take from the rich (highest ID) and give to the poor (lowest ID)
+ * Transfers: 3→1 $1, 2→1 $2
+ *
+ * With -p 3 10 20 30:
+ * Initial: P1=$10, P2=$20, P3=$30 (Total=$60)
+ * Final:   P1=$13, P2=$18, P3=$29 (Total=$60)
+ */
+
+#include "banking.h"
+
+void bank_robbery(void * parent_data, local_id max_id)
+{
+    // Transfer from highest to lowest in decreasing amounts
+    if (max_id >= 2) {
+        for (int i = max_id; i >= 2; --i) {
+            int amount = max_id - i + 1;
+            transfer(parent_data, i, 1, amount);
+        }
+    }
+}

@@ -1,0 +1,21 @@
+/**
+ * @file     bank_robbery_scenario1.c
+ * @brief    Scenario 1: Star Pattern - All to One
+ *
+ * Pattern: All processes transfer to a central process (process 1)
+ * Transfers: 2→1 $2, 3→1 $3
+ *
+ * With -p 3 10 20 30:
+ * Initial: P1=$10, P2=$20, P3=$30 (Total=$60)
+ * Final:   P1=$15, P2=$18, P3=$27 (Total=$60)
+ */
+
+#include "banking.h"
+
+void bank_robbery(void * parent_data, local_id max_id)
+{
+    // Everyone transfers their process ID worth to process 1
+    for (int i = 2; i <= max_id; ++i) {
+        transfer(parent_data, i, 1, i);
+    }
+}
