@@ -1,3 +1,6 @@
 pa2
 events.log
 pipes.log
+bank_robbery.c
+venv/
+__pycache__/
