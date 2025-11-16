@@ -257,3 +257,13 @@ def test_transfer(test_case: TransferTestCase) -> None:
     assert re.search(r"^\s*Total\s*\|", stdout, re.MULTILINE)
 
     assert re.search(rf"Total.*{test_case.expected_total_balance}", stdout)
+
+    total_line_match = re.search(r"^\s*Total\s*\|(.+)$", stdout, re.MULTILINE)
+    assert total_line_match
+
+    total_line = total_line_match.group(1)
+    total_values = re.findall(r"\s*(\d+)\s*(?:\||$)", total_line)
+
+    for i, total_str in enumerate(total_values):
+        total_at_time = int(total_str)
+        assert total_at_time == test_case.expected_total_balance
